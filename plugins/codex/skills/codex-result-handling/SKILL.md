@@ -7,6 +7,9 @@ user-invocable: false
 # Codex Result Handling
 
 When the helper returns Codex output:
+- Inspect both `runStatus` and `outcomeStatus`. A `runStatus` of `FINISHED` describes transport completion, not task success.
+- Preserve `BLOCKED`, `NEEDS_CONTEXT`, `PARTIAL`, and `INFRA_FAILED` output unchanged, including blockers, failed checks, partial work, and actionable stderr.
+- Treat `INFRA_FAILED` as a bridge/runtime failure. It is not an inspected clean audit; only a valid `COMPLETED_READ_ONLY` outcome with inspection evidence represents successful read-only completion.
 - Preserve the helper's verdict, summary, findings, and next steps structure.
 - For review output, present findings first and keep them ordered by severity.
 - Use the file paths and line numbers exactly as the helper reports them.

@@ -102,7 +102,7 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--read-only", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
@@ -129,7 +129,13 @@ function runStopReview(cwd, input = {}) {
 
   try {
     const payload = JSON.parse(result.stdout);
-    return parseStopReviewOutput(payload?.rawOutput);
+    if (payload?.outcomeStatus !== "COMPLETED_READ_ONLY") {
+      return {
+        ok: false,
+        reason: `The stop-time Codex review did not complete cleanly: ${payload?.outcomeStatus ?? "UNCLASSIFIED"}.`
+      };
+    }
+    return parseStopReviewOutput(payload?.outcome?.report);
   } catch {
     return {
       ok: false,

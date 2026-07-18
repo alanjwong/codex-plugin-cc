@@ -21,7 +21,14 @@ Execution rules:
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
 - Map `spark` to `--model gpt-5.3-codex-spark`.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Pass exactly one of `--write` or `--read-only` on every `task` call.
+- Use `--write` only for an explicit implementation/change request. Use `--read-only` for review, diagnosis, planning, research, or audit work.
+- Pass `--require-command codex-code-mode-host` when the selected Codex runtime depends on that host.
+- Preserve `--workflow-id`, `--task-id`, `--attempt-id`, and `--resume-job` as runtime controls; never include them in prompt prose.
+- Reuse the same attempt ID only for an exact duplicate request. A deliberate fresh retry gets a new explicit attempt ID after the prior attempt is terminal; never change prompt/capability fields under an existing attempt ID.
+- Inspect `outcomeStatus`; `runStatus=FINISHED` does not mean the task succeeded.
+- Return typed `BLOCKED`, `NEEDS_CONTEXT`, `PARTIAL`, and `INFRA_FAILED` output unchanged.
+- If invocation fails before a valid envelope is returned, preserve the companion's actionable stderr. Do not fabricate a substitute result.
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
@@ -30,14 +37,13 @@ Command selection:
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
+- If the forwarded request includes `--resume-job`, pass the job ID through exactly. This is the controller path for an exact correlated resume after reconciliation.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
+- `task --resume-last`: human convenience for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run. Controllers use `task --resume-job <job-id>`.
 
 Safety rules:
-- Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.

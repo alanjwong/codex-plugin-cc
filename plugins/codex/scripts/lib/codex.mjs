@@ -560,6 +560,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
+  const applyCapturedNotification = (message) => {
+    options.onTurnActivity?.();
+    applyTurnNotification(state, message);
+  };
+
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
@@ -567,7 +572,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
+      applyCapturedNotification(message);
       return;
     }
 
@@ -578,7 +583,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
     }
 
-    applyTurnNotification(state, message);
+    applyCapturedNotification(message);
   });
 
   try {
@@ -590,7 +595,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
     for (const message of state.bufferedNotifications) {
       if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
+        applyCapturedNotification(message);
       } else {
         if (previousHandler) {
           previousHandler(message);
@@ -603,7 +608,23 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    const settled = await Promise.race([
+      state.completion.then((turnState) => ({ kind: "completed", turnState })),
+      client.waitForExit().then((exit) => ({ kind: "transport_died", exit }))
+    ]);
+    if (settled.kind === "transport_died") {
+      const detail = settled.exit?.detail ||
+        `Codex app-server ${client.transport} transport closed before turn ${state.turnId ?? "unknown"} completed.`;
+      throw Object.assign(new Error(detail), {
+        code: "TRANSPORT_DIED",
+        threadId: state.threadId,
+        turnId: state.turnId,
+        detail,
+        transport: client.transport,
+        brokerEndpoint: client.endpoint ?? null
+      });
+    }
+    return settled.turnState;
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1030,6 +1051,7 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        onTurnActivity: options.onTurnActivity,
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
@@ -1050,7 +1072,9 @@ export async function runAppServerReview(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr)
+      stderr: cleanCodexStderr(client.stderr),
+      transport: client.transport,
+      brokerEndpoint: client.endpoint ?? null
     };
   });
 }
@@ -1100,25 +1124,32 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
-
-    if (options.resumeThreadId) {
-      emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: false
-      });
-      threadId = response.thread.id;
-    } else {
-      emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
-      });
-      threadId = response.thread.id;
-    }
+    emitProgress(
+      options.onProgress,
+      options.resumeThreadId
+        ? `Resuming thread ${options.resumeThreadId}.`
+        : "Starting Codex task thread.",
+      "starting"
+    );
+    const response = options.resumeThreadId
+      ? await resumeThread(client, options.resumeThreadId, cwd, {
+          model: options.model,
+          sandbox: options.sandbox,
+          ephemeral: false
+        })
+      : await startThread(client, cwd, {
+          model: options.model,
+          sandbox: options.sandbox,
+          ephemeral: options.persistThread ? false : true,
+          threadName: options.persistThread ? options.threadName : options.threadName ?? null
+        });
+    threadId = response.thread.id;
+    const runtime = {
+      cwd: response.cwd ?? response.thread.cwd ?? cwd,
+      model: response.model ?? options.model ?? null,
+      sandbox: response.sandbox ?? (options.sandbox === "read-only" ? options.sandbox : null)
+    };
+    options.assertRuntime?.(runtime);
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
       threadId
@@ -1140,18 +1171,24 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        onTurnActivity: options.onTurnActivity
+      }
     );
 
     return {
       status: buildResultStatus(turnState),
       threadId,
+      runtime,
       turnId: turnState.turnId,
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
+      transport: client.transport,
+      brokerEndpoint: client.endpoint ?? null,
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions

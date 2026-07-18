@@ -21,6 +21,7 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+export const PLUGIN_VERSION = PLUGIN_MANIFEST.version ?? "0.0.0";
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -75,6 +76,10 @@ class AppServerClientBase {
 
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
+  }
+
+  waitForExit() {
+    return this.exitPromise;
   }
 
   /**
@@ -172,7 +177,10 @@ class AppServerClientBase {
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
-    this.resolveExit(undefined);
+    this.resolveExit({
+      error: this.exitError,
+      detail: this.exitError instanceof Error ? this.exitError.message : null
+    });
   }
 
   sendMessage(_message) {

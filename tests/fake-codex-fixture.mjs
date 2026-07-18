@@ -14,18 +14,55 @@ const path = require("node:path");
 const readline = require("node:readline");
 
 	const STATE_PATH = ${JSON.stringify(statePath)};
+	const STATE_LOCK_PATH = STATE_PATH + ".lock";
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	let sigtermCount = 0;
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
-	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null };
+	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], turnStarts: [], capabilities: null, lastInterrupt: null };
 	  }
 	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
 	}
 
+	if (BEHAVIOR === "delay-sigterm") {
+	  process.on("SIGTERM", () => {
+	    sigtermCount += 1;
+	    const state = loadState();
+	    state.sigtermCount = sigtermCount;
+	    saveState(state);
+	    if (sigtermCount > 1 || state.allowSigtermExit) process.exit(143);
+	  });
+	}
+
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  const temporary = STATE_PATH + "." + process.pid + "." + Math.random().toString(36).slice(2) + ".tmp";
+  fs.writeFileSync(temporary, JSON.stringify(state, null, 2));
+  fs.renameSync(temporary, STATE_PATH);
+}
+
+function pause(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function withStateLock(callback) {
+  const deadline = Date.now() + 15000;
+  while (true) {
+    try {
+      const fd = fs.openSync(STATE_LOCK_PATH, "wx");
+      try {
+        return callback();
+      } finally {
+        fs.closeSync(fd);
+        if (fs.existsSync(STATE_LOCK_PATH)) fs.unlinkSync(STATE_LOCK_PATH);
+      }
+    } catch (error) {
+      if (error && error.code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new Error("Timed out acquiring fake Codex state lock");
+      pause(10);
+    }
+  }
 }
 
 function requiresExperimental(field, message, state) {
@@ -114,6 +151,14 @@ function buildConfigReadResult() {
 
 function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
+}
+
+function reportedSandbox(requestedSandbox) {
+  if (BEHAVIOR === "missing-sandbox") return undefined;
+  if (BEHAVIOR === "wrong-sandbox") {
+    return { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false };
+  }
+  return requestedSandbox;
 }
 
 function nextThread(state, cwd, ephemeral) {
@@ -247,6 +292,104 @@ function taskPayload(prompt, resume) {
   return "Handled the requested task.\\nTask prompt accepted.";
 }
 
+function taskEnvelope(overrides = {}) {
+  return JSON.stringify({
+    schemaVersion: 1,
+    outcomeStatus: "COMPLETED_READ_ONLY",
+    report: "Handled the requested task.\\nTask prompt accepted.",
+    changedFiles: [],
+    checks: [],
+    blocker: null,
+    inspected: true,
+    evidence: ["Task prompt"],
+    ...overrides
+  });
+}
+
+function typedTaskPayload(prompt, resume, thread) {
+  if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
+    return taskEnvelope({
+      report: BEHAVIOR === "adversarial-clean"
+        ? "ALLOW: No blocking issues found in the previous turn."
+        : "BLOCK: Missing empty-state guard in src/app.js:4-6.",
+      evidence: ["Previous Claude response"]
+    });
+  }
+
+  if (BEHAVIOR === "task-invalid-json") {
+    return "not valid json";
+  }
+  if (BEHAVIOR === "task-blocked") {
+    return taskEnvelope({
+      outcomeStatus: "BLOCKED",
+      report: "The required host is unavailable.",
+      blocker: {
+        kind: "runtime",
+        message: "Host unavailable",
+        retryWhen: "Host is installed"
+      }
+    });
+  }
+  if (BEHAVIOR === "task-partial") {
+    return taskEnvelope({
+      outcomeStatus: "PARTIAL",
+      report: "Completed the inspection, but one follow-up remains."
+    });
+  }
+  if (BEHAVIOR === "task-write-no-events") {
+    fs.writeFileSync(path.join(thread.cwd, "output.txt"), "fixture task output\\n", "utf8");
+    return taskEnvelope({
+      outcomeStatus: "READY_FOR_INTEGRATION",
+      report: "Wrote output.txt.",
+      changedFiles: ["output.txt"]
+    });
+  }
+  if (BEHAVIOR === "task-write-with-drift") {
+    fs.writeFileSync(path.join(thread.cwd, "app.txt"), "fixture app change\\n", "utf8");
+    fs.writeFileSync(path.join(thread.cwd, "scratch-drift.txt"), "fixture drift\\n", "utf8");
+    return taskEnvelope({
+      outcomeStatus: "READY_FOR_INTEGRATION",
+      report: "Updated app.txt.",
+      changedFiles: ["app.txt"]
+    });
+  }
+  if (BEHAVIOR === "task-write-canonical-event") {
+    fs.writeFileSync(path.join(fs.realpathSync(thread.cwd), "app.txt"), "fixture app change\\n", "utf8");
+    return taskEnvelope({
+      outcomeStatus: "READY_FOR_INTEGRATION",
+      report: "Updated app.txt.",
+      changedFiles: ["app.txt"]
+    });
+  }
+  if (BEHAVIOR === "task-read-only-with-drift") {
+    fs.writeFileSync(path.join(thread.cwd, "scratch-drift.txt"), "fixture drift\\n", "utf8");
+  }
+  if (BEHAVIOR === "interruptible-partial-write") {
+    const turnCount = loadState().turnStarts.filter((turn) => turn.threadId === thread.id).length;
+    if (turnCount === 1) {
+      fs.writeFileSync(path.join(thread.cwd, "partial-edit.txt"), "partial edit\\n", "utf8");
+    } else {
+      fs.appendFileSync(path.join(thread.cwd, "partial-edit.txt"), "resumed edit\\n", "utf8");
+      return taskEnvelope({
+        outcomeStatus: "READY_FOR_INTEGRATION",
+        report: "Completed partial-edit.txt.",
+        changedFiles: ["partial-edit.txt"]
+      });
+    }
+  }
+
+  const report = resume || prompt.includes("Continue from the current thread state") || prompt.includes("follow up")
+    ? "Resumed the prior run.\\nFollow-up prompt accepted."
+    : "Handled the requested task.\\nTask prompt accepted.";
+  if (thread.sandbox === "workspace-write") {
+    return taskEnvelope({
+      outcomeStatus: "READY_FOR_INTEGRATION",
+      report
+    });
+  }
+  return taskEnvelope({ report });
+}
+
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
   console.log("codex-cli test");
@@ -270,9 +413,11 @@ if (args[0] === "login") {
 if (args[0] !== "app-server") {
   process.exit(1);
 }
-const bootState = loadState();
-bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
-saveState(bootState);
+withStateLock(() => {
+  const bootState = loadState();
+  bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+  saveState(bootState);
+});
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -280,11 +425,12 @@ rl.on("line", (line) => {
     return;
   }
 
-  const message = JSON.parse(line);
-  const state = loadState();
+  withStateLock(() => {
+    const message = JSON.parse(line);
+    const state = loadState();
 
-  try {
-    switch (message.method) {
+    try {
+      switch (message.method) {
       case "initialize":
         state.capabilities = message.params.capabilities || null;
         saveState(state);
@@ -313,7 +459,9 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        thread.sandbox = message.params.sandbox;
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: reportedSandbox(message.params.sandbox), reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -346,8 +494,9 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        thread.sandbox = message.params.sandbox;
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: reportedSandbox(message.params.sandbox), reasoningEffort: null } });
         break;
       }
 
@@ -438,25 +587,52 @@ rl.on("line", (line) => {
 
 	      case "turn/start": {
 	        const thread = ensureThread(state, message.params.threadId);
+	        if (BEHAVIOR === "task-infrastructure-throw") {
+	          throw new Error("failed to spawn code-mode host");
+	        }
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")
           .map((item) => item.text)
           .join("\\n");
         const turnId = nextTurnId(state);
         thread.updatedAt = now();
-	        state.lastTurnStart = {
+	        const turnStart = {
 	          threadId: message.params.threadId,
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
 	          prompt
 	        };
+	        state.lastTurnStart = turnStart;
+	        state.turnStarts = [...(state.turnStarts || []), turnStart];
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
+        if (BEHAVIOR === "task-stalls-silently") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          break;
+        }
+
+        if (BEHAVIOR === "task-transport-dies") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({
+            method: "item/started",
+            params: {
+              threadId: thread.id,
+              turnId,
+              item: { type: "agentMessage", id: "msg_" + turnId, text: "partial", phase: "commentary" }
+            }
+          });
+          setTimeout(() => process.exit(42), 10);
+          break;
+        }
+
+        const resume = thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state");
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+          : message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.outcomeStatus
+            ? typedTaskPayload(prompt, resume, thread)
+            : taskPayload(prompt, resume);
 
         if (
           BEHAVIOR === "with-subagent" ||
@@ -580,22 +756,52 @@ rl.on("line", (line) => {
               }
             ]
             : []),
-          {
-            completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" }
-          }
+          ...(BEHAVIOR === "task-turn-failed-no-message" || (BEHAVIOR === "interruptible-partial-write" && state.turnStarts.filter((turn) => turn.threadId === thread.id).length === 1)
+            ? []
+            : [{
+                completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" }
+              }]),
+          ...(BEHAVIOR === "task-write-with-drift" || BEHAVIOR === "task-write-canonical-event" || BEHAVIOR === "interruptible-partial-write"
+            ? [{
+                completed: {
+                  type: "fileChange",
+                  id: "file_" + turnId,
+                  changes: BEHAVIOR === "interruptible-partial-write"
+                    ? [{ path: "partial-edit.txt" }]
+                    : [{
+                        path: BEHAVIOR === "task-write-canonical-event"
+                          ? path.join(fs.realpathSync(thread.cwd), "app.txt")
+                          : path.join(thread.cwd, "app.txt"),
+                        kind: "update"
+                      }],
+                  status: "completed"
+                }
+              }]
+            : [])
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "task-turn-failed" || BEHAVIOR === "task-turn-failed-no-message") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
-	          const timer = setTimeout(() => {
-	            if (!interruptibleTurns.has(turnId)) {
-	              return;
+	          for (const entry of items) {
+	            if (entry && entry.completed) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
 	            }
+	          }
+	          const error = { message: "fixture turn failure" };
+	          send({ method: "error", params: { threadId: thread.id, turnId, error } });
+	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed", error) } });
+	        } else if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "interrupt-fails" || (BEHAVIOR === "interruptible-partial-write" && state.turnStarts.filter((turn) => turn.threadId === thread.id).length === 1)) {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          for (const entry of BEHAVIOR === "interruptible-partial-write" ? items : []) {
+	            if (entry && entry.completed) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	          }
+	          const timer = BEHAVIOR === "interruptible-partial-write" ? null : setTimeout(() => {
+	            if (!interruptibleTurns.has(turnId)) return;
 	            interruptibleTurns.delete(turnId);
 	            for (const entry of items) {
-	              if (entry && entry.completed) {
-	                send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
-	              }
+	              if (entry && entry.completed) send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          }, 5000);
@@ -614,9 +820,13 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "interrupt-fails") {
+	          send({ id: message.id, error: { code: -32000, message: "fixture interrupt failure" } });
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
-	          clearTimeout(pending.timer);
+	          if (pending.timer) clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);
 	          send({
 	            method: "turn/completed",
@@ -633,10 +843,11 @@ rl.on("line", (line) => {
 	      default:
 	        send({ id: message.id, error: { code: -32601, message: "Unsupported method: " + message.method } });
         break;
-    }
-  } catch (error) {
-    send({ id: message.id, error: { code: -32000, message: error.message } });
-  }
+	      }
+	    } catch (error) {
+	      send({ id: message.id, error: { code: -32000, message: error.message } });
+	    }
+	  });
 });
 `;
   writeExecutable(scriptPath, source);

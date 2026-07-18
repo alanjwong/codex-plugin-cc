@@ -41,8 +41,14 @@ function writePidFile(pidFile) {
   if (!pidFile) {
     return;
   }
-  fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-  fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
+  fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(pidFile, `${process.pid}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+// The broker is spawned with stdout/stderr piped to broker.log, so this is the
+// durable forensic record for the session.
+function logLine(message) {
+  process.stdout.write(`[${new Date().toISOString()}] ${message}\n`);
 }
 
 async function main() {
@@ -52,7 +58,9 @@ async function main() {
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    // launch-token is consumed only via this process's argv (visible to ps)
+    // for process-identity verification; the broker ignores its value.
+    valueOptions: ["cwd", "pid-file", "endpoint", "launch-token"]
   });
 
   if (!options.endpoint) {
@@ -66,10 +74,12 @@ async function main() {
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  logLine(`Broker pid ${process.pid} serving ${endpoint} for ${cwd} (codex app-server pid ${appClient.proc?.pid ?? "unknown"}).`);
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let shuttingDown = false;
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -100,6 +110,8 @@ async function main() {
   }
 
   async function shutdown(server) {
+    logLine(`Broker shutting down on request (${sockets.size} client socket(s) connected).`);
+    shuttingDown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -230,6 +242,31 @@ async function main() {
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+    });
+  });
+
+  void appClient.waitForExit().then((exit) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    const stderr = (appClient.stderr ?? "").trim();
+    const detail = exit?.detail ?? "clean exit (code 0)";
+    logLine(
+      `codex app-server exited mid-session: ${detail}; destroying ${sockets.size} client socket(s)` +
+        `${activeStreamSocket ? " while a streaming turn was active" : ""}.` +
+        (stderr && !detail.includes(stderr) ? `\ncodex app-server stderr:\n${stderr}` : "")
+    );
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    server.close(() => {
+      if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
+        fs.unlinkSync(listenTarget.path);
+      }
+      if (pidFile && fs.existsSync(pidFile)) {
+        fs.unlinkSync(pidFile);
+      }
     });
   });
 

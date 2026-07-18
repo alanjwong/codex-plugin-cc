@@ -3,12 +3,19 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  loadState,
+  readJobFile,
+  resolveStateDir,
+  transitionStoredJob
+} from "../plugins/codex/scripts/lib/state.mjs";
+import { processIsAlive } from "../plugins/codex/scripts/lib/job-reconciliation.mjs";
+import { captureProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -26,6 +33,44 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function spawnCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      ...options,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (status, signal) => {
+      resolve({ status, signal, stdout, stderr });
+    });
+  });
+}
+
+function spawnDetachedSleeper(cwd, source = "setInterval(() => {}, 1000)", launchToken = null) {
+  const launcher = run(process.execPath, [
+    "-e",
+    `const { spawn } = require("node:child_process"); const args = ["-e", ${JSON.stringify(source)}]; const launchToken = ${JSON.stringify(launchToken)}; if (launchToken) args.push("--", "--launch-token", launchToken); const child = spawn(process.execPath, args, { detached: true, stdio: "ignore" }); child.unref(); process.stdout.write(String(child.pid));`
+  ], { cwd });
+  assert.equal(launcher.status, 0, launcher.stderr);
+  const pid = Number(launcher.stdout.trim());
+  assert.equal(Number.isFinite(pid), true);
+  return { pid };
+}
+
+function loadFakeState(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -166,7 +211,7 @@ test("task runs when the active provider does not require OpenAI login", () => {
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "check auth preflight"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "check auth preflight"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -184,7 +229,7 @@ test("task runs without auth preflight so Codex can refresh an expired session",
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "check refreshable auth"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "check refreshable auth"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -336,7 +381,7 @@ test("task reports the actual Codex auth error when the run is rejected", () => 
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "check failed auth"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "check failed auth"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -488,19 +533,472 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+  const firstRun = run("node", [SCRIPT, "task", "--read-only", "initial task"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
   assert.equal(firstRun.status, 0, firstRun.stderr);
 
-  const result = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "--resume-last", "follow up"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  assert.equal(result.stdout, "Outcome: COMPLETED_READ_ONLY\n\nResumed the prior run.\nFollow-up prompt accepted.\n");
+});
+
+test("simultaneous idempotent task attempts return the same job id and start one thread", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const args = [
+    SCRIPT,
+    "task",
+    "--read-only",
+    "--background",
+    "--json",
+    "--workflow-id",
+    "wf-shared",
+    "--task-id",
+    "task-shared",
+    "inspect the retry path"
+  ];
+
+  const [left, right] = await Promise.all([
+    spawnCommand("node", args, { cwd: repo, env }),
+    spawnCommand("node", args, { cwd: repo, env })
+  ]);
+
+  assert.equal(left.status, 0, left.stderr);
+  assert.equal(right.status, 0, right.stderr);
+  const leftPayload = JSON.parse(left.stdout);
+  const rightPayload = JSON.parse(right.stdout);
+  assert.equal(leftPayload.jobId, rightPayload.jobId);
+  const fakeState = await waitFor(() => {
+    if (!fs.existsSync(path.join(binDir, "fake-codex-state.json"))) return null;
+    const state = loadFakeState(binDir);
+    return state.threads.length === 1 ? state : null;
+  }, { timeoutMs: 15000 });
+  assert.equal(fakeState.threads.length, 1);
+});
+
+test("simultaneous workflow reservation with changed input rejects one attempt", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const base = [
+    SCRIPT,
+    "task",
+    "--read-only",
+    "--background",
+    "--json",
+    "--workflow-id",
+    "wf-conflict",
+    "--task-id",
+    "task-conflict"
+  ];
+
+  const results = await Promise.all([
+    spawnCommand("node", [...base, "inspect the retry path"], { cwd: repo, env }),
+    spawnCommand("node", [...base, "rewrite the retry path"], { cwd: repo, env })
+  ]);
+  const winner = results.find((result) => result.status === 0);
+  const loser = results.find((result) => result.status !== 0);
+  assert.ok(winner, results.map((result) => result.stderr).join("\n"));
+  assert.ok(loser, results.map((result) => result.stdout).join("\n"));
+  const winnerPayload = JSON.parse(winner.stdout);
+  assert.match(loser.stderr, new RegExp(winnerPayload.jobId));
+  assert.match(loser.stderr, /same workflow and task attempt.*different request/i);
+  assert.equal(loadState(repo).jobs.length, 1);
+  const fakeState = await waitFor(() => {
+    if (!fs.existsSync(path.join(binDir, "fake-codex-state.json"))) return null;
+    const state = loadFakeState(binDir);
+    return state.threads.length === 1 ? state : null;
+  }, { timeoutMs: 15000 });
+  assert.equal(fakeState.threads.length, 1);
+});
+
+test("simultaneous workflow writers share one workspace reservation from root and nested cwd", async () => {
+  const repo = makeTempDir();
+  const nested = path.join(repo, "src", "nested");
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.mkdirSync(nested, { recursive: true });
+  const env = buildEnv(binDir);
+  const taskArgs = (workflowId, taskId, prompt) => [
+    SCRIPT,
+    "task",
+    "--write",
+    "--background",
+    "--json",
+    "--workflow-id",
+    workflowId,
+    "--task-id",
+    taskId,
+    prompt
+  ];
+
+  const results = await Promise.all([
+    spawnCommand("node", taskArgs("wf-root", "task-root", "update the root task"), { cwd: repo, env }),
+    spawnCommand("node", taskArgs("wf-nested", "task-nested", "update the nested task"), { cwd: nested, env })
+  ]);
+  const winner = results.find((result) => result.status === 0);
+  const loser = results.find((result) => result.status !== 0);
+  assert.ok(winner, results.map((result) => result.stderr).join("\n"));
+  assert.ok(loser, results.map((result) => result.stdout).join("\n"));
+  const winnerPayload = JSON.parse(winner.stdout);
+  assert.match(loser.stderr, new RegExp(winnerPayload.jobId));
+  assert.match(loser.stderr, /active write attempt/i);
+  const fakeState = await waitFor(() => {
+    if (!fs.existsSync(path.join(binDir, "fake-codex-state.json"))) return null;
+    const state = loadFakeState(binDir);
+    return state.turnStarts?.length === 1 ? state : null;
+  }, { timeoutMs: 15000 });
+  assert.equal(fakeState.turnStarts.length, 1);
+});
+
+test("an active workflow writer does not block an unrelated read-only task", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const writer = run("node", [
+    SCRIPT,
+    "task",
+    "--write",
+    "--background",
+    "--json",
+    "--workflow-id",
+    "wf-writer",
+    "--task-id",
+    "task-writer",
+    "update the app"
+  ], { cwd: repo, env });
+  assert.equal(writer.status, 0, writer.stderr);
+  await waitFor(() => {
+    if (!fs.existsSync(path.join(binDir, "fake-codex-state.json"))) return false;
+    return loadFakeState(binDir).turnStarts?.length === 1;
+  }, { timeoutMs: 15000 });
+
+  const reader = run("node", [
+    SCRIPT,
+    "task",
+    "--read-only",
+    "--background",
+    "--json",
+    "--workflow-id",
+    "wf-reader",
+    "--task-id",
+    "task-reader",
+    "inspect the app"
+  ], { cwd: repo, env });
+  assert.equal(reader.status, 0, reader.stderr);
+  const fakeState = await waitFor(() => {
+    const state = loadFakeState(binDir);
+    return state.turnStarts?.length === 2 ? state : null;
+  }, { timeoutMs: 15000 });
+  assert.equal(fakeState.turnStarts.length, 2);
+});
+
+test("workflow writers in linked worktrees use different state directories", async () => {
+  const repo = makeTempDir();
+  const linkedParent = makeTempDir();
+  const linked = path.join(linkedParent, "linked");
+  const pluginDataDir = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "fixture\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "fixture"], { cwd: repo });
+  const added = run("git", ["worktree", "add", "-b", "fixture-linked", linked], { cwd: repo });
+  assert.equal(added.status, 0, added.stderr);
+  const env = { ...buildEnv(binDir), CLAUDE_PLUGIN_DATA: pluginDataDir };
+  const taskArgs = (workflowId, taskId, prompt) => [
+    SCRIPT,
+    "task",
+    "--write",
+    "--background",
+    "--json",
+    "--workflow-id",
+    workflowId,
+    "--task-id",
+    taskId,
+    prompt
+  ];
+
+  const [left, right] = await Promise.all([
+    spawnCommand("node", taskArgs("wf-main", "task-main", "update the main worktree"), { cwd: repo, env }),
+    spawnCommand("node", taskArgs("wf-linked", "task-linked", "update the linked worktree"), { cwd: linked, env })
+  ]);
+  assert.equal(left.status, 0, left.stderr);
+  assert.equal(right.status, 0, right.stderr);
+  assert.notEqual(JSON.parse(left.stdout).jobId, JSON.parse(right.stdout).jobId);
+  const stateDirs = await waitFor(() => {
+    const stateRoot = path.join(pluginDataDir, "state");
+    if (!fs.existsSync(stateRoot)) return null;
+    const directories = fs.readdirSync(stateRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+    if (directories.length !== 2) return null;
+    const jobs = directories.flatMap((directory) => {
+      const stateFile = path.join(stateRoot, directory, "state.json");
+      if (!fs.existsSync(stateFile)) return [];
+      return JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs;
+    });
+    return jobs.length === 2 && jobs.every((job) => job.runStatus === "RUNNING")
+      ? directories
+      : null;
+  }, { timeoutMs: 15000 });
+  const fakeState = await waitFor(() => {
+    if (!fs.existsSync(path.join(binDir, "fake-codex-state.json"))) return null;
+    const state = loadFakeState(binDir);
+    return state.turnStarts?.length === 2 ? state : null;
+  }, { timeoutMs: 15000 });
+  assert.equal(fakeState.turnStarts.length, 2);
+  assert.equal(stateDirs.length, 2);
+  assert.notEqual(stateDirs[0], stateDirs[1]);
+});
+
+test("task --resume-job resumes the requested thread rather than the newest thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  assert.equal(run("node", [SCRIPT, "task", "--read-only", "first task"], { cwd: repo, env }).status, 0);
+  const first = loadState(repo).jobs[0];
+  assert.equal(run("node", [SCRIPT, "task", "--read-only", "second task"], { cwd: repo, env }).status, 0);
+
+  const resumed = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--resume-job", first.id, "follow up first"],
+    { cwd: repo, env }
+  );
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, first.threadId);
+  const child = loadState(repo).jobs[0];
+  assert.equal(child.parentJobId, first.id);
+  assert.equal(child.taskId, first.taskId);
+  assert.notEqual(child.attemptId, first.attemptId);
+});
+
+test("exact resume can cross Claude sessions but not workspaces", () => {
+  const repo = makeTempDir();
+  const otherRepo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  for (const workspace of [repo, otherRepo]) {
+    initGitRepo(workspace);
+    fs.writeFileSync(path.join(workspace, "README.md"), "fixture\n", "utf8");
+    run("git", ["add", "README.md"], { cwd: workspace });
+    run("git", ["commit", "-m", "fixture"], { cwd: workspace });
+  }
+  const baseEnv = buildEnv(binDir);
+  const firstSession = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "sess-one" };
+  const secondSession = { ...baseEnv, CODEX_COMPANION_SESSION_ID: "sess-two" };
+
+  const firstRun = run("node", [SCRIPT, "task", "--read-only", "inspect the first repo"], {
+    cwd: repo,
+    env: firstSession
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const parent = loadState(repo).jobs[0];
+  assert.match(parent.completionSnapshotToken, /^[a-f0-9]{64}$/);
+
+  const resumed = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--resume-job", parent.id, "continue the inspection"],
+    { cwd: repo, env: secondSession }
+  );
+  assert.equal(resumed.status, 0, resumed.stderr);
+
+  fs.writeFileSync(path.join(repo, "README.md"), "fixture changed after completion\n", "utf8");
+  const driftedResume = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--resume-job", parent.id, "continue after drift"],
+    { cwd: repo, env: secondSession }
+  );
+  assert.equal(driftedResume.status, 1);
+  assert.match(driftedResume.stderr, /needs reconciliation/i);
+
+  const observed = run("node", [SCRIPT, "reconcile", parent.id, "--json"], {
+    cwd: repo,
+    env: secondSession
+  });
+  assert.equal(observed.status, 0, observed.stderr);
+  const observedPayload = JSON.parse(observed.stdout);
+  assert.equal(observedPayload.workspaceDrift, true);
+  assert.match(observedPayload.currentSnapshotToken, /^[a-f0-9]{64}$/);
+
+  const accepted = run(
+    "node",
+    [SCRIPT, "reconcile", parent.id, "--accept-snapshot", observedPayload.currentSnapshotToken, "--json"],
+    { cwd: repo, env: secondSession }
+  );
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.equal(JSON.parse(accepted.stdout).nextAction, "resume_exact_job");
+  const resumedAfterAcceptance = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--resume-job", parent.id, "continue after acceptance"],
+    { cwd: repo, env: secondSession }
+  );
+  assert.equal(resumedAfterAcceptance.status, 0, resumedAfterAcceptance.stderr);
+
+  const wrongWorkspace = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--resume-job", parent.id, "continue the inspection"],
+    { cwd: otherRepo, env: secondSession }
+  );
+  assert.equal(wrongWorkspace.status, 1);
+  assert.match(wrongWorkspace.stderr, /No job found|workspace mismatch/i);
+});
+
+test("exact snapshot reconciliation notices later tracked and untracked content changes", async (t) => {
+  for (const variant of ["tracked", "untracked"]) {
+    await t.test(variant, () => {
+      const repo = makeTempDir();
+      const binDir = makeTempDir();
+      installFakeCodex(binDir);
+      initGitRepo(repo);
+      fs.writeFileSync(path.join(repo, "README.md"), "fixture\n", "utf8");
+      run("git", ["add", "README.md"], { cwd: repo });
+      run("git", ["commit", "-m", "fixture"], { cwd: repo });
+      const changedPath = variant === "tracked"
+        ? path.join(repo, "README.md")
+        : path.join(repo, "notes.txt");
+      fs.writeFileSync(changedPath, "dirty before task\n", "utf8");
+      const env = buildEnv(binDir);
+
+      const initial = run("node", [SCRIPT, "task", "--read-only", "inspect dirty state"], { cwd: repo, env });
+      assert.equal(initial.status, 0, initial.stderr);
+      const parent = loadState(repo).jobs[0];
+      const reconciled = run("node", [SCRIPT, "reconcile", parent.id, "--json"], { cwd: repo, env });
+      assert.equal(reconciled.status, 0, reconciled.stderr);
+      assert.equal(JSON.parse(reconciled.stdout).workspaceDrift, false);
+
+      fs.writeFileSync(changedPath, "dirty after reconciliation\n", "utf8");
+      const resume = run(
+        "node",
+        [SCRIPT, "task", "--read-only", "--resume-job", parent.id, "continue inspection"],
+        { cwd: repo, env }
+      );
+      assert.equal(resume.status, 1);
+      assert.match(resume.stderr, /needs reconciliation/i);
+    });
+  }
+});
+
+test("reconcile records a clean baseline without starting Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "fixture\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "fixture"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const initial = run("node", [SCRIPT, "task", "--read-only", "inspect"], { cwd: repo, env });
+  assert.equal(initial.status, 0, initial.stderr);
+  const job = loadState(repo).jobs[0];
+  const fakeStateBefore = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+
+  const result = run("node", [SCRIPT, "reconcile", job.id, "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.workspaceDrift, false);
+  assert.equal(payload.nextAction, "resume_exact_job");
+  assert.match(payload.reconciledAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  const fakeStateAfter = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeStateAfter.nextTurnId, fakeStateBefore.nextTurnId);
+  assert.equal(fakeStateAfter.threads.length, fakeStateBefore.threads.length);
+});
+
+test("an interrupted non-Git write cannot accept an arbitrary snapshot token", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+  transitionStoredJob(repo, "task-nongit", () => ({
+    id: "task-nongit",
+    status: "failed",
+    runStatus: "INTERRUPTED",
+    outcomeStatus: "NEEDS_RECONCILIATION",
+    jobClass: "task",
+    intent: "write",
+    write: true,
+    workspaceRealpath: fs.realpathSync(repo),
+    threadId: "thr_nongit",
+    preflight: {
+      workspaceRealpath: fs.realpathSync(repo),
+      git: null
+    }
+  }));
+
+  const result = run(
+    "node",
+    [SCRIPT, "reconcile", "task-nongit", "--accept-snapshot", "a".repeat(64), "--json"],
+    { cwd: repo, env }
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /no exact Git snapshot/i);
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+});
+
+test("status preserves a queued start lease and interrupts it only after expiry", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  transitionStoredJob(repo, "task-reserved", () => ({
+    id: "task-reserved",
+    status: "queued",
+    runStatus: "QUEUED",
+    outcomeStatus: null,
+    jobClass: "task",
+    intent: "write",
+    write: true,
+    pid: null,
+    reservedAt: new Date().toISOString(),
+    startDeadlineAt: new Date(Date.now() + 15000).toISOString()
+  }));
+
+  const healthy = run("node", [SCRIPT, "status", "task-reserved", "--json"], { cwd: repo, env });
+  assert.equal(healthy.status, 0, healthy.stderr);
+  assert.equal(JSON.parse(healthy.stdout).job.runStatus, "QUEUED");
+  assert.equal(loadState(repo).jobs[0].runStatus, "QUEUED");
+
+  transitionStoredJob(repo, "task-reserved", (current) => ({
+    ...current,
+    startDeadlineAt: new Date(Date.now() - 1000).toISOString()
+  }));
+  const expired = run("node", [SCRIPT, "status", "task-reserved", "--json"], { cwd: repo, env });
+  assert.equal(expired.status, 0, expired.stderr);
+  assert.equal(JSON.parse(expired.stdout).job.runStatus, "INTERRUPTED");
+  assert.equal(loadState(repo).jobs[0].outcomeStatus, "NEEDS_RECONCILIATION");
+
+  const jobId = loadState(repo).jobs[0].id;
+  const events = fs
+    .readFileSync(path.join(resolveStateDir(repo), "jobs", `${jobId}.events.jsonl`), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const reconciledEvent = events.find((event) => event.type === "reconciled");
+  assert.ok(reconciledEvent, "reconciliation must append an event");
+  assert.equal(reconciledEvent.acceptedRunStatus, "INTERRUPTED");
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
@@ -589,7 +1087,7 @@ test("task --resume-last does not resume a task from another Claude session", ()
     CODEX_COMPANION_SESSION_ID: "sess-current"
   };
 
-  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+  const firstRun = run("node", [SCRIPT, "task", "--read-only", "initial task"], {
     cwd: repo,
     env: otherEnv
   });
@@ -602,7 +1100,7 @@ test("task --resume-last does not resume a task from another Claude session", ()
   assert.equal(candidate.status, 0, candidate.stderr);
   assert.equal(JSON.parse(candidate.stdout).available, false);
 
-  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
+  const resume = run("node", [SCRIPT, "task", "--read-only", "--resume-last", "follow up"], {
     cwd: repo,
     env: currentEnv
   });
@@ -661,7 +1159,7 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
   assert.equal(status.status, 0, status.stderr);
   assert.deepEqual(JSON.parse(status.stdout).running, []);
 
-  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
+  const resume = run("node", [SCRIPT, "task", "--read-only", "--resume-last", "follow up"], {
     cwd: repo,
     env
   });
@@ -713,7 +1211,285 @@ test("write task output focuses on the Codex result without generic follow-up hi
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Outcome: READY_FOR_INTEGRATION\n\nHandled the requested task.\nTask prompt accepted.\n");
+});
+
+test("blocked task output is finished, persisted separately, and rendered honestly", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-blocked");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const task = run("node", [SCRIPT, "task", "--read-only", "--json", "inspect the runtime"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(task.status, 0, task.stderr);
+  const taskPayload = JSON.parse(task.stdout);
+  assert.equal(taskPayload.runStatus, "FINISHED");
+  assert.equal(taskPayload.outcomeStatus, "BLOCKED");
+  assert.equal(taskPayload.outcome.success, false);
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const jobId = state.jobs[0].id;
+  const status = run("node", [SCRIPT, "status", jobId, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(status.status, 0, status.stderr);
+  const statusPayload = JSON.parse(status.stdout);
+  assert.equal(statusPayload.job.status, "completed");
+  assert.equal(statusPayload.job.runStatus, "FINISHED");
+  assert.equal(statusPayload.job.outcomeStatus, "BLOCKED");
+
+  const result = run("node", [SCRIPT, "result", jobId, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const resultPayload = JSON.parse(result.stdout);
+  assert.equal(resultPayload.job.runStatus, "FINISHED");
+  assert.equal(resultPayload.job.outcomeStatus, "BLOCKED");
+  assert.equal(resultPayload.storedJob.runStatus, "FINISHED");
+  assert.equal(resultPayload.storedJob.outcomeStatus, "BLOCKED");
+
+  const human = run("node", [SCRIPT, "result", jobId], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(human.status, 0, human.stderr);
+  assert.match(human.stdout, /^Outcome: BLOCKED/);
+});
+
+test("partial task output is a valid finished semantic outcome", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-partial");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--read-only", "--json", "inspect what is available"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "FINISHED");
+  assert.equal(payload.outcomeStatus, "PARTIAL");
+  assert.equal(payload.outcome.success, false);
+});
+
+test("invalid task output is a finished transport with an unclassified protocol result", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-invalid-json");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--read-only", "--json", "inspect the target"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "FINISHED");
+  assert.equal(payload.outcomeStatus, "UNCLASSIFIED");
+  assert.equal(payload.transport.status, 0);
+  assert.ok(["broker", "direct"].includes(payload.transport.kind), `transport kind recorded (${payload.transport.kind})`);
+  assert.equal(payload.rawOutput, "not valid json");
+  assert.match(payload.outcome.protocolError, /valid JSON/);
+});
+
+test("failed task turn ignores valid-looking output and becomes infrastructure failure", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-turn-failed");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--read-only", "--json", "inspect the target"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "FAILED");
+  assert.equal(payload.outcomeStatus, "INFRA_FAILED");
+  assert.match(payload.rawOutput, /COMPLETED_READ_ONLY/);
+  assert.equal(payload.transport.turnStatus, "failed");
+  assert.equal(payload.transport.error, "fixture turn failure");
+});
+
+test("failed task turn without a final message preserves infrastructure error evidence", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-turn-failed-no-message");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--read-only", "--json", "inspect the target"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.outcomeStatus, "INFRA_FAILED");
+  assert.equal(payload.rawOutput, "");
+  assert.equal(payload.transport.error, "fixture turn failure");
+  assert.match(payload.outcome.report, /fixture turn failure/);
+});
+
+test("task infrastructure throw is persisted as a durable infrastructure outcome", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-infrastructure-throw");
+  initGitRepo(repo);
+
+  const task = run("node", [SCRIPT, "task", "--read-only", "--json", "inspect the target"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(task.status, 1);
+  const taskPayload = JSON.parse(task.stdout);
+  assert.equal(taskPayload.runStatus, "FAILED");
+  assert.equal(taskPayload.outcomeStatus, "INFRA_FAILED");
+  assert.match(taskPayload.outcome.report, /failed to spawn code-mode host/);
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const jobId = state.jobs[0].id;
+  assert.equal(state.jobs[0].status, "failed");
+  assert.equal(state.jobs[0].runStatus, "FAILED");
+  assert.equal(state.jobs[0].outcomeStatus, "INFRA_FAILED");
+
+  const result = run("node", [SCRIPT, "result", jobId, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const resultPayload = JSON.parse(result.stdout);
+  assert.equal(resultPayload.storedJob.outcomeStatus, "INFRA_FAILED");
+});
+
+test("task output write without events in a non-Git workspace keeps a corroboration warning", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-write-no-events");
+
+  const result = run("node", [SCRIPT, "task", "--write", "--json", "write the output"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "FINISHED");
+  assert.equal(payload.outcomeStatus, "READY_FOR_INTEGRATION");
+  assert.deepEqual(payload.eventTouchedFiles, []);
+  assert.deepEqual(payload.snapshotChangedFiles, []);
+  assert.deepEqual(payload.reportedChangedFiles, ["output.txt"]);
+  assert.match(payload.outcome.consistencyWarnings.join("\n"), /could not be corroborated/);
+  assert.equal(fs.readFileSync(path.join(repo, "output.txt"), "utf8"), "fixture task output\n");
+});
+
+test("task output write with drift finishes needing reconciliation and names the blocker file", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-write-with-drift");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--write", "--json", "update the app"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "FINISHED");
+  assert.equal(payload.outcomeStatus, "NEEDS_RECONCILIATION");
+  assert.deepEqual(payload.eventTouchedFiles, ["app.txt"]);
+  assert.deepEqual(payload.snapshotChangedFiles, ["app.txt", "scratch-drift.txt"]);
+  assert.deepEqual(payload.reportedChangedFiles, ["app.txt"]);
+  assert.deepEqual(payload.unattributedDriftFiles, ["scratch-drift.txt"]);
+  assert.equal(payload.outcome.blocker.kind, "workspace_drift");
+  assert.match(payload.outcome.blocker.message, /scratch-drift\.txt/);
+});
+
+test("canonical event paths normalize inside a symlinked workspace root", () => {
+  const realWorkspace = makeTempDir();
+  const linkParent = makeTempDir();
+  const linkedWorkspace = path.join(linkParent, "linked-workspace");
+  fs.symlinkSync(realWorkspace, linkedWorkspace, process.platform === "win32" ? "junction" : "dir");
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-write-canonical-event");
+
+  const result = run("node", [SCRIPT, "task", "--write", "--cwd", linkedWorkspace, "--json", "update the app"], {
+    cwd: ROOT,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.outcomeStatus, "READY_FOR_INTEGRATION");
+  assert.deepEqual(payload.eventTouchedFiles, ["app.txt"]);
+  assert.equal(fs.readFileSync(path.join(realWorkspace, "app.txt"), "utf8"), "fixture app change\n");
+});
+
+test("read-only task output keeps its semantic outcome when snapshot drift appears", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-read-only-with-drift");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--read-only", "--json", "inspect the app"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "FINISHED");
+  assert.equal(payload.outcomeStatus, "COMPLETED_READ_ONLY");
+  assert.deepEqual(payload.unattributedDriftFiles, ["scratch-drift.txt"]);
+  assert.match(payload.outcome.consistencyWarnings.join("\n"), /drift/i);
+});
+
+test("inexact deinitialized gitlink evidence degrades uncorroborated task output to a warning", () => {
+  const origin = makeTempDir();
+  initGitRepo(origin);
+  fs.writeFileSync(path.join(origin, "README.md"), "submodule\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: origin });
+  run("git", ["commit", "-m", "init submodule"], { cwd: origin });
+
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-write-no-events");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "parent\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init parent"], { cwd: repo });
+  run("git", ["-c", "protocol.file.allow=always", "submodule", "add", origin, "vendor/sub"], { cwd: repo });
+  run("git", ["commit", "-am", "add submodule"], { cwd: repo });
+  run("git", ["submodule", "deinit", "-f", "vendor/sub"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "output.txt"), "fixture task output\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--write", "--json", "write the output"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.finalSnapshot.git.exact, false);
+  assert.equal(payload.outcomeStatus, "READY_FOR_INTEGRATION");
+  assert.deepEqual(payload.snapshotChangedFiles, []);
+  assert.match(payload.outcome.consistencyWarnings.join("\n"), /could not be corroborated/);
 });
 
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
@@ -726,13 +1502,13 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+  const firstRun = run("node", [SCRIPT, "task", "--read-only", "initial task"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
   assert.equal(firstRun.status, 0, firstRun.stderr);
 
-  const result = run("node", [SCRIPT, "task", "--resume", "follow up"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "--resume", "follow up"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -753,7 +1529,7 @@ test("task --fresh is treated as routing control and does not leak into the prom
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "--fresh", "diagnose the flaky test"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "--fresh", "diagnose the flaky test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -773,7 +1549,7 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "--model", "spark", "--effort", "low", "diagnose the failing test"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "--model", "spark", "--effort", "low", "diagnose the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -793,7 +1569,7 @@ test("task logs reasoning summaries and assistant messages to the job log", () =
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "investigate the failing test"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "investigate the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -817,7 +1593,7 @@ test("task logs subagent reasoning and messages with a subagent prefix", () => {
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "challenge the current design"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -845,13 +1621,13 @@ test("task waits for the main thread to complete before returning the final resu
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "challenge the current design"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Outcome: COMPLETED_READ_ONLY\n\nHandled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task ignores later subagent messages when choosing the final returned output", () => {
@@ -863,13 +1639,13 @@ test("task ignores later subagent messages when choosing the final returned outp
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "challenge the current design"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Outcome: COMPLETED_READ_ONLY\n\nHandled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
@@ -881,13 +1657,13 @@ test("task can finish after subagent work even if the parent turn/completed even
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "challenge the current design"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Outcome: COMPLETED_READ_ONLY\n\nHandled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task using the shared broker still completes when Codex spawns subagents", () => {
@@ -911,13 +1687,13 @@ test("task using the shared broker still completes when Codex spawns subagents",
     return;
   }
 
-  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+  const result = run("node", [SCRIPT, "task", "--read-only", "challenge the current design"], {
     cwd: repo,
     env
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Outcome: COMPLETED_READ_ONLY\n\nHandled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -929,7 +1705,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
+  const launched = run("node", [SCRIPT, "task", "--read-only", "--background", "--json", "investigate the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -967,6 +1743,129 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("a silently stalled task reports turn quietness and remains user-cancellable", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-stalls-silently");
+  initGitRepo(repo);
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_TURN_QUIET_WARN_MS: "25"
+  };
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--background", "--json", "observe the silent turn"],
+    { cwd: repo, env }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  t.after(() => {
+    const job = loadState(repo).jobs.find((entry) => entry.id === jobId);
+    for (const pid of [job?.pid, loadBrokerSession(repo)?.pid]) {
+      if (!Number.isFinite(pid)) continue;
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {
+          // The successful cancel path already stopped it.
+        }
+      }
+    }
+  });
+
+  const claimed = await waitFor(() => {
+    const job = loadState(repo).jobs.find((entry) => entry.id === jobId);
+    return job?.runStatus === "RUNNING" && job.turnId && job.lastProgressAt ? job : null;
+  }, { timeoutMs: 15_000 });
+  const claimProgressAt = claimed.lastProgressAt;
+
+  const persistedActivity = await waitFor(() => {
+    const job = loadState(repo).jobs.find((entry) => entry.id === jobId);
+    return job?.lastProgressAt && job.lastProgressAt !== claimProgressAt ? job : null;
+  }, { timeoutMs: 8_000 });
+  assert.equal(persistedActivity.runStatus, "RUNNING");
+
+  const quietStatus = await waitFor(() => {
+    const status = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+    if (status.status !== 0) return null;
+    const payload = JSON.parse(status.stdout);
+    return payload.job.turnQuietWarning ? payload : null;
+  }, { timeoutMs: 3_000 });
+  assert.equal(quietStatus.job.lastProgressAt, persistedActivity.lastProgressAt);
+  assert.equal(quietStatus.job.turnQuietWarning, true);
+  assert.ok(quietStatus.job.turnQuietMs > 25);
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).runStatus, "CANCELLED");
+  assert.equal(loadState(repo).jobs.find((entry) => entry.id === jobId).runStatus, "CANCELLED");
+});
+
+test("an app-server transport death fails promptly with exact resume identifiers", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "task-transport-dies");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--background", "--json", "observe transport failure"],
+    { cwd: repo, env }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  t.after(() => {
+    const job = loadState(repo).jobs.find((entry) => entry.id === jobId);
+    for (const pid of [job?.pid, loadBrokerSession(repo)?.pid]) {
+      if (!Number.isFinite(pid)) continue;
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {
+          // Expected once transport propagation has completed.
+        }
+      }
+    }
+  });
+
+  const failed = await waitFor(() => {
+    const job = loadState(repo).jobs.find((entry) => entry.id === jobId);
+    return job?.runStatus === "FAILED" ? job : null;
+  }, { timeoutMs: 8_000 });
+
+  assert.equal(failed.outcomeStatus, "INFRA_FAILED");
+  assert.equal(failed.outcome.blocker.kind, "transport_failure");
+  assert.equal(failed.outcome.retryable, true);
+  assert.match(failed.outcome.blocker.retryWhen, /Retry, or reconcile and resume the stored thread/);
+  assert.match(failed.threadId, /^thr_/);
+  assert.match(failed.turnId, /^turn_/);
+  assert.equal(failed.result.threadId, failed.threadId);
+  assert.equal(failed.result.turnId, failed.turnId);
+  assert.equal(failed.result.outcome.blocker.kind, "transport_failure");
+  assert.equal(failed.pid, null);
+  assert.match(failed.pluginVersion ?? "", /^\d+\.\d+\.\d+/, "job records carry the plugin version");
+  assert.ok(
+    ["broker", "direct"].includes(failed.result.transport.kind),
+    `transport kind recorded on failure (${failed.result.transport.kind})`
+  );
+  if (failed.result.transport.kind === "broker") {
+    const logFile = loadBrokerSession(repo)?.logFile;
+    assert.ok(logFile, "broker session must expose its log file");
+    await waitFor(() => {
+      const contents = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
+      return contents.includes("codex app-server exited mid-session") ? contents : null;
+    }, { timeoutMs: 4_000 });
+  }
 });
 
 test("review rejects focus text because it is native-review only", () => {
@@ -1306,8 +2205,15 @@ test("status --wait times out cleanly when a job is still active", () => {
       {
         id: "task-live",
         status: "running",
+        runStatus: "RUNNING",
         title: "Codex Task",
-        logFile
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        pid: process.pid,
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
       },
       null,
       2
@@ -1325,9 +2231,11 @@ test("status --wait times out cleanly when a job is still active", () => {
           {
             id: "task-live",
             status: "running",
+            runStatus: "RUNNING",
             title: "Codex Task",
             jobClass: "task",
             summary: "Investigate flaky test",
+            pid: process.pid,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -1513,7 +2421,7 @@ test("result without a job id prefers the latest finished job from the current C
   );
 });
 
-test("result for a finished write-capable task returns the raw Codex final response", () => {
+test("result for a finished write-capable task returns the typed Codex outcome", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -1534,7 +2442,7 @@ test("result for a finished write-capable task returns the raw Codex final respo
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /^Handled the requested task\.\nTask prompt accepted\.\n/);
+  assert.match(result.stdout, /^Outcome: READY_FOR_INTEGRATION\n\nHandled the requested task\.\nTask prompt accepted\.\n/);
   assert.match(result.stdout, /Codex session ID: thr_[a-z0-9]+/i);
   assert.match(result.stdout, /Resume in Codex: codex resume thr_[a-z0-9]+/i);
 });
@@ -1545,12 +2453,9 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-    cwd: workspace,
-    detached: true,
-    stdio: "ignore"
-  });
-  sleeper.unref();
+  const launchToken = "cancel-live-token-0123456789abcdef";
+  const sleeper = spawnDetachedSleeper(workspace, undefined, launchToken);
+  const workerIdentity = { ...captureProcessIdentity(sleeper.pid), token: launchToken };
 
   t.after(() => {
     try {
@@ -1573,8 +2478,16 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
       {
         id: "task-live",
         status: "running",
+        runStatus: "RUNNING",
         title: "Codex Task",
-        logFile
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        pid: sleeper.pid,
+        workerIdentity,
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
       },
       null,
       2
@@ -1595,6 +2508,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
             jobClass: "task",
             summary: "Investigate flaky test",
             pid: sleeper.pid,
+            workerIdentity,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -1632,6 +2546,74 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(stored.status, "cancelled");
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
+});
+
+test("cancel never signals a legacy record that has no worker identity", async (t) => {
+  const workspace = makeTempDir();
+  const sleeper = spawnDetachedSleeper(workspace);
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+  transitionStoredJob(workspace, "task-legacy", () => ({
+    id: "task-legacy",
+    status: "running",
+    runStatus: "RUNNING",
+    outcomeStatus: null,
+    title: "Codex Task",
+    jobClass: "task",
+    intent: "read-only",
+    // Legacy shape: a pid but no workerIdentity. The pid may have been
+    // recycled by an unrelated process, so it must never be signaled.
+    pid: sleeper.pid
+  }));
+
+  const result = run("node", [SCRIPT, "cancel", "task-legacy", "--json"], { cwd: workspace });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "CANCEL_REQUESTED");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(processIsAlive(sleeper.pid), true, "legacy pids must never be signaled");
+});
+
+test("cancel reconciles a stale-heartbeat job without signaling its reused live pid", (t) => {
+  const workspace = makeTempDir();
+  const sleeper = spawnDetachedSleeper(workspace);
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      // Ignore a worker that already exited.
+    }
+  });
+  transitionStoredJob(workspace, "task-stale-heartbeat", () => ({
+    id: "task-stale-heartbeat",
+    status: "running",
+    runStatus: "RUNNING",
+    outcomeStatus: null,
+    jobClass: "task",
+    intent: "write",
+    pid: sleeper.pid,
+    heartbeatAt: "2026-01-01T00:00:00.000Z"
+  }));
+
+  const result = run("node", [SCRIPT, "cancel", "task-stale-heartbeat", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.runStatus, "INTERRUPTED");
+  assert.equal(payload.outcomeStatus, "NEEDS_RECONCILIATION");
+  assert.equal(payload.turnInterruptAttempted, false);
+  assert.equal(processIsAlive(sleeper.pid), true);
 });
 
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {
@@ -1734,7 +2716,8 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(state.jobs[0].runStatus, "INTERRUPTED");
+  assert.equal(state.jobs[0].outcomeStatus, "NEEDS_RECONCILIATION");
 });
 
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
@@ -1748,7 +2731,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
   const env = buildEnv(binDir);
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+  const launched = run("node", [SCRIPT, "task", "--read-only", "--background", "--json", "investigate the flaky worker timeout"], {
     cwd: repo,
     env
   });
@@ -1801,7 +2784,174 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("session end fully cleans up jobs for the ending session", async (t) => {
+test("cancel treats worker exit with an unconfirmed turn interrupt as interrupted", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interrupt-fails");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--background", "--json", "wait for failed interrupt"],
+    { cwd: repo, env }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  await waitFor(() => {
+    const job = loadState(repo).jobs.find((candidate) => candidate.id === jobId);
+    return job?.runStatus === "RUNNING" && job.threadId && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  const payload = JSON.parse(cancelled.stdout);
+  assert.equal(payload.runStatus, "INTERRUPTED");
+  assert.equal(payload.outcomeStatus, "NEEDS_RECONCILIATION");
+  const stored = loadState(repo).jobs.find((job) => job.id === jobId);
+  assert.equal(stored.runStatus, "INTERRUPTED");
+  assert.equal(stored.blocker.kind, "turn_interrupt_unconfirmed");
+  assert.equal(stored.pid, null);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+test("a delayed worker stays cancel requested until a repeated cancel confirms exit", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const launchToken = "delayed-worker-token-0123456789abcdef";
+  const worker = spawnDetachedSleeper(
+    repo,
+    "let signals = 0; process.on('SIGTERM', () => { signals += 1; if (signals > 1) process.exit(0); }); setInterval(() => {}, 1000);",
+    launchToken
+  );
+  t.after(() => {
+    try {
+      process.kill(-worker.pid, "SIGKILL");
+    } catch {
+      // Ignore a worker that already exited.
+    }
+  });
+  transitionStoredJob(repo, "task-delay", () => ({
+    id: "task-delay",
+    status: "running",
+    runStatus: "RUNNING",
+    outcomeStatus: null,
+    title: "Codex Task",
+    jobClass: "task",
+    intent: "read-only",
+    write: false,
+    workspaceRealpath: fs.realpathSync(repo),
+    workflowId: "wf-delay",
+    taskId: "task-delay",
+    attemptId: "initial",
+    logicalTaskKey: "wf-delay:task-delay",
+    idempotencyKey: "wf-delay:task-delay:initial",
+    requestFingerprint: "seeded-delay",
+    threadId: "thr_delay",
+    pid: worker.pid,
+    workerIdentity: { ...captureProcessIdentity(worker.pid), token: launchToken }
+  }));
+
+  const first = run("node", [SCRIPT, "cancel", "task-delay", "--json"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const firstPayload = JSON.parse(first.stdout);
+  assert.equal(firstPayload.runStatus, "CANCEL_REQUESTED");
+  assert.equal(firstPayload.outcomeStatus, "NEEDS_RECONCILIATION");
+  const retained = loadState(repo).jobs[0];
+  assert.equal(retained.pid, worker.pid);
+  assert.equal(processIsAlive(worker.pid), true);
+
+  const status = run("node", [SCRIPT, "status", "task-delay", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).job.runStatus, "CANCEL_REQUESTED");
+  const resume = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--resume-job", "task-delay", "resume too early"],
+    { cwd: repo, env }
+  );
+  assert.equal(resume.status, 1);
+  assert.match(resume.stderr, /still active/i);
+  const nextAttempt = run(
+    "node",
+    [SCRIPT, "task", "--read-only", "--workflow-id", "wf-delay", "--task-id", "task-delay", "--attempt-id", "second", "new attempt"],
+    { cwd: repo, env }
+  );
+  assert.equal(nextAttempt.status, 1);
+  assert.match(nextAttempt.stderr, /already has active attempt/i);
+
+  const second = run("node", [SCRIPT, "cancel", "task-delay", "--json"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  const secondPayload = JSON.parse(second.stdout);
+  assert.equal(secondPayload.runStatus, "CANCELLED");
+  assert.equal(secondPayload.outcomeStatus, "CANCELLED");
+  const finished = loadState(repo).jobs[0];
+  assert.equal(finished.runStatus, "CANCELLED");
+  assert.equal(finished.pid, null);
+});
+
+test("late completion cannot override a pending foreground cancellation", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const taskResultPromise = spawnCommand(
+    "node",
+    [SCRIPT, "task", "--write", "--json", "allow a late completion"],
+    { cwd: repo, env }
+  );
+  const running = await waitFor(() => {
+    const job = loadState(repo).jobs[0];
+    return job?.runStatus === "RUNNING" && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+  transitionStoredJob(repo, running.id, (current) => ({
+    ...current,
+    status: "running",
+    runStatus: "CANCEL_REQUESTED",
+    outcomeStatus: "NEEDS_RECONCILIATION",
+    cancelRequestedAt: new Date().toISOString(),
+    blocker: {
+      kind: "live_worker_cancellation_unconfirmed",
+      message: "Cancellation remains unconfirmed.",
+      retryWhen: "Reconcile the worker and workspace"
+    }
+  }));
+
+  const taskResult = await taskResultPromise;
+  assert.notEqual(taskResult.status, 0);
+  const payload = JSON.parse(taskResult.stdout);
+  assert.equal(payload.runStatus, "CANCEL_REQUESTED");
+  assert.equal(payload.outcomeStatus, "NEEDS_RECONCILIATION");
+  const stored = loadState(repo).jobs.find((job) => job.id === running.id);
+  assert.equal(stored.runStatus, "CANCEL_REQUESTED");
+  assert.equal(stored.outcomeStatus, "NEEDS_RECONCILIATION");
+  assert.equal("terminalWriteId" in stored, false);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+test("session end preserves history and marks active attempts interrupted", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -1821,16 +2971,8 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   fs.writeFileSync(completedLog, "completed\n", "utf8");
   fs.writeFileSync(runningLog, "running\n", "utf8");
   fs.writeFileSync(otherSessionLog, "other\n", "utf8");
-  fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
-  fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
-
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-    cwd: repo,
-    detached: true,
-    stdio: "ignore"
-  });
-  sleeper.unref();
-  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  const launchToken = "session-end-token-0123456789abcdef";
+  const sleeper = spawnDetachedSleeper(repo, undefined, launchToken);
 
   t.after(() => {
     try {
@@ -1844,42 +2986,50 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     }
   });
 
+  const jobs = [
+    {
+      id: "review-completed",
+      status: "completed",
+      runStatus: "FINISHED",
+      title: "Codex Review",
+      sessionId: "sess-current",
+      logFile: completedLog,
+      createdAt: "2026-03-18T15:30:00.000Z",
+      updatedAt: "2026-03-18T15:31:00.000Z"
+    },
+    {
+      id: "review-running",
+      status: "running",
+      runStatus: "RUNNING",
+      title: "Codex Review",
+      sessionId: "sess-current",
+      pid: sleeper.pid,
+      workerIdentity: { ...captureProcessIdentity(sleeper.pid), token: launchToken },
+      logFile: runningLog,
+      createdAt: "2026-03-18T15:32:00.000Z",
+      updatedAt: "2026-03-18T15:33:00.000Z"
+    },
+    {
+      id: "review-other",
+      status: "completed",
+      runStatus: "FINISHED",
+      title: "Codex Review",
+      sessionId: "sess-other",
+      logFile: otherSessionLog,
+      createdAt: "2026-03-18T15:34:00.000Z",
+      updatedAt: "2026-03-18T15:35:00.000Z"
+    }
+  ];
+  fs.writeFileSync(completedJobFile, JSON.stringify(jobs[0], null, 2), "utf8");
+  fs.writeFileSync(runningJobFile, JSON.stringify(jobs[1], null, 2), "utf8");
+  fs.writeFileSync(otherJobFile, JSON.stringify(jobs[2], null, 2), "utf8");
   fs.writeFileSync(
     path.join(stateDir, "state.json"),
     `${JSON.stringify(
       {
-        version: 1,
+        version: 2,
         config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-completed",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            logFile: completedLog,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:31:00.000Z"
-          },
-          {
-            id: "review-running",
-            status: "running",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            pid: sleeper.pid,
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          },
-          {
-            id: "review-other",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-other",
-            logFile: otherSessionLog,
-            createdAt: "2026-03-18T15:34:00.000Z",
-            updatedAt: "2026-03-18T15:35:00.000Z"
-          }
-        ]
+        jobs
       },
       null,
       2
@@ -1901,13 +3051,6 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(fs.existsSync(otherSessionLog), true);
-  assert.equal(fs.existsSync(otherJobFile), true);
-  assert.deepEqual(
-    fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
-  );
-
   await waitFor(() => {
     try {
       process.kill(sleeper.pid, 0);
@@ -1917,10 +3060,122 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     }
   });
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
-  const otherJob = state.jobs[0];
-  assert.equal(otherJob.logFile, otherSessionLog);
+  const state = loadState(repo);
+  assert.deepEqual(
+    new Set(state.jobs.map((job) => job.id)),
+    new Set(["review-completed", "review-running", "review-other"])
+  );
+  assert.equal(fs.existsSync(completedLog), true);
+  assert.equal(fs.existsSync(completedJobFile), true);
+  assert.equal(fs.existsSync(runningLog), true);
+  assert.equal(fs.existsSync(runningJobFile), true);
+  assert.equal(fs.existsSync(otherSessionLog), true);
+  assert.equal(fs.existsSync(otherJobFile), true);
+
+  const interrupted = readJobFile(runningJobFile);
+  assert.equal(interrupted.runStatus, "INTERRUPTED");
+  assert.equal(interrupted.outcomeStatus, "NEEDS_RECONCILIATION");
+  assert.equal(interrupted.pid, null);
+});
+
+test("session end retains a live worker until a later session observes its exit", async (t) => {
+  const repo = makeTempDir();
+  const launchToken = "session-retained-token-0123456789abcdef";
+  const worker = spawnDetachedSleeper(
+    repo,
+    "let signals = 0; process.on('SIGTERM', () => { signals += 1; if (signals > 1) process.exit(0); }); setInterval(() => {}, 1000);",
+    launchToken
+  );
+  t.after(() => {
+    try {
+      process.kill(-worker.pid, "SIGKILL");
+    } catch {
+      // Ignore a worker that already exited.
+    }
+  });
+  transitionStoredJob(repo, "task-session-live", () => ({
+    id: "task-session-live",
+    status: "running",
+    runStatus: "RUNNING",
+    outcomeStatus: null,
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-old",
+    threadId: "thr_session_live",
+    pid: worker.pid,
+    workerIdentity: { ...captureProcessIdentity(worker.pid), token: launchToken }
+  }));
+
+  const ended = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-old" },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-old", cwd: repo })
+  });
+  assert.equal(ended.status, 0, ended.stderr);
+  const retained = loadState(repo).jobs[0];
+  assert.equal(retained.runStatus, "CANCEL_REQUESTED");
+  assert.equal(retained.outcomeStatus, "NEEDS_RECONCILIATION");
+  assert.equal(retained.orphaned, true);
+  assert.equal(retained.pid, worker.pid);
+  assert.equal(processIsAlive(worker.pid), true);
+
+  process.kill(-worker.pid, "SIGTERM");
+  await waitFor(() => !processIsAlive(worker.pid));
+  const observed = run("node", [SCRIPT, "status", "task-session-live", "--json"], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-new" }
+  });
+  assert.equal(observed.status, 0, observed.stderr);
+  assert.equal(JSON.parse(observed.stdout).job.runStatus, "INTERRUPTED");
+  assert.equal(loadState(repo).jobs[0].outcomeStatus, "NEEDS_RECONCILIATION");
+});
+
+test("session end and terminal completion preserve one canonical race winner", async () => {
+  const repo = makeTempDir();
+  transitionStoredJob(repo, "task-session-race", () => ({
+    id: "task-session-race",
+    status: "running",
+    runStatus: "RUNNING",
+    outcomeStatus: null,
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-race",
+    pid: null
+  }));
+  const stateModule = pathToFileURL(path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs")).href;
+  const reconciliationModule = pathToFileURL(
+    path.join(PLUGIN_ROOT, "scripts", "lib", "job-reconciliation.mjs")
+  ).href;
+  const terminalScript = `
+    const { transitionStoredJob } = await import(${JSON.stringify(stateModule)});
+    const { transitionJob } = await import(${JSON.stringify(reconciliationModule)});
+    transitionStoredJob(${JSON.stringify(repo)}, "task-session-race", (current) => transitionJob(current, {
+      status: "completed",
+      runStatus: "FINISHED",
+      outcomeStatus: "COMPLETED_READ_ONLY",
+      pid: null,
+      terminalWriteId: "completion-race"
+    }));
+  `;
+
+  const [ended, completed] = await Promise.all([
+    spawnCommand("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-race" }
+    }),
+    spawnCommand(process.execPath, ["--input-type=module", "-e", terminalScript], { cwd: repo })
+  ]);
+  assert.equal(ended.status, 0, ended.stderr);
+  assert.equal(completed.status, 0, completed.stderr);
+  const indexed = loadState(repo).jobs.find((job) => job.id === "task-session-race");
+  const durable = readJobFile(path.join(resolveStateDir(repo), "jobs", "task-session-race.json"));
+  assert.deepEqual(indexed, durable);
+  assert.ok(["FINISHED", "INTERRUPTED"].includes(durable.runStatus));
+  if (durable.runStatus === "FINISHED") {
+    assert.equal(durable.terminalWriteId, "completion-race");
+  } else {
+    assert.equal("terminalWriteId" in durable, false);
+  }
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
@@ -1977,6 +3232,20 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /Codex Stop Gate Review/);
+
+  const typedStatus = run("node", [SCRIPT, "status", "--json"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_SESSION_ID: "sess-stop-review"
+    }
+  });
+  assert.equal(typedStatus.status, 0, typedStatus.stderr);
+  const typedPayload = JSON.parse(typedStatus.stdout);
+  assert.equal(typedPayload.latestFinished.runStatus, "FINISHED");
+  assert.equal(typedPayload.latestFinished.outcomeStatus, "COMPLETED_READ_ONLY");
+  assert.equal(typedPayload.latestFinished.outcome.inspected, true);
+  assert.deepEqual(typedPayload.latestFinished.outcome.evidence, ["Previous Claude response"]);
 });
 
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
@@ -2256,4 +3525,105 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+test("a correlated duplicate reconciles a partial write and resumes one exact attempt", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-partial-write");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "fixture\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "fixture"], { cwd: repo });
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-acceptance" };
+  const args = [
+    SCRIPT,
+    "task",
+    "--background",
+    "--json",
+    "--write",
+    "--workflow-id",
+    "wf-acceptance",
+    "--task-id",
+    "task-1",
+    "fix the retry bug"
+  ];
+
+  const firstLaunch = run("node", args, { cwd: repo, env });
+  assert.equal(firstLaunch.status, 0, firstLaunch.stderr);
+  const firstJobId = JSON.parse(firstLaunch.stdout).jobId;
+
+  const duplicateLaunch = run("node", args, { cwd: repo, env });
+  assert.equal(duplicateLaunch.status, 0, duplicateLaunch.stderr);
+  assert.equal(JSON.parse(duplicateLaunch.stdout).jobId, firstJobId);
+
+  const runningJob = await waitFor(() => {
+    const job = loadState(repo).jobs.find((entry) => entry.id === firstJobId);
+    return job?.threadId && job?.runStatus === "RUNNING" ? job : null;
+  }, { timeoutMs: 15000 });
+  await waitFor(() => fs.existsSync(path.join(repo, "partial-edit.txt")), { timeoutMs: 15000 });
+  const fakeBefore = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeBefore.threads.length, 1);
+
+  const ended = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-acceptance",
+      cwd: repo
+    })
+  });
+  assert.equal(ended.status, 0, ended.stderr);
+  const interrupted = readJobFile(path.join(resolveStateDir(repo), "jobs", `${firstJobId}.json`));
+  assert.equal(interrupted.runStatus, "INTERRUPTED");
+  assert.equal(interrupted.outcomeStatus, "NEEDS_RECONCILIATION");
+
+  const reconciled = run("node", [SCRIPT, "reconcile", firstJobId, "--json"], { cwd: repo, env });
+  assert.equal(reconciled.status, 0, reconciled.stderr);
+  const reconciliation = JSON.parse(reconciled.stdout);
+  assert.equal(reconciliation.workspaceDrift, true);
+  assert.equal(reconciliation.nextAction, "inspect_workspace_diff");
+  assert.match(reconciliation.currentSnapshotToken, /^[a-f0-9]{64}$/);
+
+  const rejectedResume = run(
+    "node",
+    [SCRIPT, "task", "--json", "--write", "--resume-job", firstJobId, "continue after interruption"],
+    { cwd: repo, env }
+  );
+  assert.equal(rejectedResume.status, 1);
+  assert.match(rejectedResume.stderr, /accept.*snapshot|reconciliation/i);
+
+  const accepted = run(
+    "node",
+    [
+      SCRIPT,
+      "reconcile",
+      firstJobId,
+      "--accept-snapshot",
+      reconciliation.currentSnapshotToken,
+      "--json"
+    ],
+    { cwd: repo, env }
+  );
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.equal(
+    JSON.parse(accepted.stdout).reconciledSnapshotToken,
+    reconciliation.currentSnapshotToken
+  );
+
+  const resumed = run(
+    "node",
+    [SCRIPT, "task", "--json", "--write", "--resume-job", firstJobId, "continue after interruption"],
+    { cwd: repo, env }
+  );
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(JSON.parse(resumed.stdout).outcomeStatus, "READY_FOR_INTEGRATION");
+
+  const child = loadState(repo).jobs.find((entry) => entry.parentJobId === firstJobId);
+  assert.equal(child.threadId, runningJob.threadId);
+  assert.equal(child.workflowId, "wf-acceptance");
+  assert.equal(child.taskId, "task-1");
+  const fakeAfter = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeAfter.threads.length, 1);
 });

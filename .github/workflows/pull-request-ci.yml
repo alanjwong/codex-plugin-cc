@@ -26,7 +26,9 @@ jobs:
         run: npm ci
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex
+        # Pinned to the version this fork was validated against; bump
+        # deliberately after re-running the suite against the new release.
+        run: npm install -g @openai/codex@0.144.4
 
       - name: Run test suite
         run: npm test

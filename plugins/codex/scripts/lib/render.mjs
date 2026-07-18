@@ -1,3 +1,5 @@
+import { effectiveRunStatus, isActiveJob, isTerminalJob } from "./job-reconciliation.mjs";
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -81,8 +83,29 @@ function isStructuredReviewStoredResult(storedJob) {
   );
 }
 
+function isTypedTaskStoredResult(storedJob) {
+  return Boolean(
+    storedJob?.outcomeStatus ||
+    storedJob?.outcome?.outcomeStatus ||
+    storedJob?.result?.outcomeStatus ||
+    storedJob?.result?.outcome?.outcomeStatus
+  );
+}
+
+function displayJobStatus(job) {
+  return {
+    QUEUED: "queued",
+    RUNNING: "running",
+    CANCEL_REQUESTED: "cancel_requested",
+    FINISHED: "completed",
+    FAILED: "failed",
+    CANCELLED: "cancelled",
+    INTERRUPTED: "interrupted"
+  }[effectiveRunStatus(job)] ?? "failed";
+}
+
 function formatJobLine(job) {
-  const parts = [job.id, `${job.status || "unknown"}`];
+  const parts = [job.id, displayJobStatus(job)];
   if (job.kindLabel) {
     parts.push(job.kindLabel);
   }
@@ -112,11 +135,11 @@ function appendActiveJobsTable(lines, jobs) {
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
-    if (job.status === "queued" || job.status === "running") {
+    if (isActiveJob(job)) {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(displayJobStatus(job))} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
@@ -129,6 +152,10 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
   }
+  lines.push(`  Run status: ${effectiveRunStatus(job)}`);
+  if (job.outcomeStatus) {
+    lines.push(`  Outcome: ${job.outcomeStatus}`);
+  }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
   }
@@ -138,6 +165,12 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.threadId) {
     lines.push(`  Codex session ID: ${job.threadId}`);
   }
+  if (isActiveJob(job) && job.turnQuietWarning) {
+    const quietMinutes = Math.max(1, Math.floor((job.turnQuietMs ?? 0) / 60_000));
+    lines.push(
+      `  Warning: no turn activity observed for ${quietMinutes}m. This may be deep reasoning or a severed connection; inspect the log or cancel.`
+    );
+  }
   const resumeCommand = formatCodexResumeCommand(job);
   if (resumeCommand) {
     lines.push(`  Resume in Codex: ${resumeCommand}`);
@@ -145,13 +178,13 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
   }
-  if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
+  if (isActiveJob(job) && options.showCancelHint) {
     lines.push(`  Cancel: /codex:cancel ${job.id}`);
   }
-  if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
+  if (isTerminalJob(job) && options.showResultHint) {
     lines.push(`  Result: /codex:result ${job.id}`);
   }
-  if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
+  if (isTerminalJob(job) && job.jobClass === "task" && job.write && options.showReviewHint) {
     lines.push("  Review changes: /codex:review --wait");
     lines.push("  Stricter review: /codex:adversarial-review --wait");
   }
@@ -348,7 +381,7 @@ export function renderStatusReport(report) {
     lines.push("Latest finished:");
     pushJobDetails(lines, report.latestFinished, {
       showDuration: true,
-      showLog: report.latestFinished.status === "failed"
+      showLog: effectiveRunStatus(report.latestFinished) === "FAILED"
     });
     lines.push("");
   }
@@ -358,7 +391,7 @@ export function renderStatusReport(report) {
     for (const job of report.recent) {
       pushJobDetails(lines, job, {
         showDuration: true,
-        showLog: job.status === "failed"
+        showLog: effectiveRunStatus(job) === "FAILED"
       });
     }
     lines.push("");
@@ -377,8 +410,8 @@ export function renderStatusReport(report) {
 export function renderJobStatusReport(job) {
   const lines = ["# Codex Job Status", ""];
   pushJobDetails(lines, job, {
-    showElapsed: job.status === "queued" || job.status === "running",
-    showDuration: job.status !== "queued" && job.status !== "running",
+    showElapsed: isActiveJob(job),
+    showDuration: isTerminalJob(job),
     showLog: true,
     showCancelHint: true,
     showResultHint: true,
@@ -390,7 +423,7 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
-  if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
+  if ((isStructuredReviewStoredResult(storedJob) || isTypedTaskStoredResult(storedJob)) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
       return output;
@@ -422,7 +455,7 @@ export function renderStoredJobResult(job, storedJob) {
     `# ${job.title ?? "Codex Result"}`,
     "",
     `Job: ${job.id}`,
-    `Status: ${job.status}`
+    `Status: ${displayJobStatus(job)}`
   ];
 
   if (threadId) {
@@ -445,11 +478,19 @@ export function renderStoredJobResult(job, storedJob) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderCancelReport(job) {
+export function renderCancelReport(job, options = {}) {
+  const runStatus = effectiveRunStatus(job);
+  const headline = options.alreadyFinished && isTerminalJob(job)
+    ? `Job ${job.id} already finished before cancellation (${runStatus}).`
+    : runStatus === "CANCELLED"
+    ? `Cancelled ${job.id}.`
+    : runStatus === "CANCEL_REQUESTED"
+      ? `Cancellation requested for ${job.id}.`
+      : `Cancellation of ${job.id} requires reconciliation.`;
   const lines = [
     "# Codex Cancel",
     "",
-    `Cancelled ${job.id}.`,
+    headline,
     ""
   ];
 

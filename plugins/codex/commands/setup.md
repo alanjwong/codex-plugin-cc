@@ -35,3 +35,5 @@ Output rules:
 - Present the final setup output to the user.
 - If installation was skipped, present the original setup output.
 - If Codex is installed but not authenticated, preserve the guidance to run `!codex login`.
+- Treat `setup` as a diagnostic only. It does not replace the static and runtime preflight performed for every `task` invocation.
+- `externalSandbox` runtimes are deliberately unsupported for tasks. Runtime attestation fails closed instead of starting a model turn when the effective sandbox does not match the task intent.

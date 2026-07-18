@@ -1,7 +1,20 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  effectiveRunStatus,
+  transitionJob,
+  workspaceSnapshotToken
+} from "./job-reconciliation.mjs";
+import {
+  appendJobEvent,
+  privateAppendFileSync,
+  privateWriteFileSync,
+  resolveJobLogFile,
+  touchJobHeartbeat,
+  transitionStoredJob
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -38,19 +51,19 @@ export function appendLogLine(logFile, message) {
   if (!logFile || !normalized) {
     return;
   }
-  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
+  privateAppendFileSync(logFile, `[${nowIso()}] ${normalized}\n`);
 }
 
 export function appendLogBlock(logFile, title, body) {
   if (!logFile || !body) {
     return;
   }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+  privateAppendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`);
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
   const logFile = resolveJobLogFile(workspaceRoot, jobId);
-  fs.writeFileSync(logFile, "", "utf8");
+  privateWriteFileSync(logFile, "");
   if (title) {
     appendLogLine(logFile, `Starting ${title}.`);
   }
@@ -99,18 +112,15 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
+    try {
+      transitionStoredJob(workspaceRoot, jobId, (current) => ({
+        ...current,
+        ...patch
+      }));
+    } catch {
+      // A progress patch lost to lock contention is harmless; the next
+      // event or the terminal transition carries the same identifiers.
     }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
   };
 }
 
@@ -131,74 +141,147 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
+function buildTerminalRecord(runningRecord, execution) {
+  const runStatus = execution.runStatus ?? (execution.exitStatus === 0 ? "FINISHED" : "FAILED");
+  const legacyStatus = runStatus === "FINISHED" ? "completed" : "failed";
+  // Never carry claim-time telemetry into the terminal write; the on-disk
+  // values are fresher and are the durable liveness/activity evidence.
+  const {
+    heartbeatAt: _staleHeartbeat,
+    lastProgressAt: _staleLastProgress,
+    ...base
+  } = runningRecord;
+  return {
+    ...base,
+    status: legacyStatus,
+    runStatus,
+    outcomeStatus: execution.outcomeStatus ?? null,
+    outcome: execution.outcome ?? null,
+    threadId: execution.threadId ?? null,
+    turnId: execution.turnId ?? null,
+    pid: null,
+    phase: legacyStatus === "completed" ? "done" : "failed",
+    completedAt: nowIso(),
+    summary: execution.summary,
+    result: execution.payload,
+    rendered: execution.rendered,
+    completionSnapshotToken: workspaceSnapshotToken(execution.payload?.finalSnapshot)
+  };
+}
+
+function executionFromAcceptedJob(job) {
+  const runStatus = effectiveRunStatus(job);
+  const outcomeStatus = job.outcomeStatus ?? "NEEDS_RECONCILIATION";
+  const report = job.blocker?.message ?? `Job ${job.id} ended as ${runStatus}.`;
+  return {
+    exitStatus: runStatus === "FINISHED" && outcomeStatus !== "UNCLASSIFIED" ? 0 : 1,
+    runStatus,
+    outcomeStatus,
+    outcome: job.outcome ?? null,
+    threadId: job.threadId ?? null,
+    turnId: job.turnId ?? null,
+    payload: job.result ?? {
+      jobId: job.id,
+      runStatus,
+      outcomeStatus,
+      blocker: job.blocker ?? null
+    },
+    rendered: job.rendered ?? `Outcome: ${outcomeStatus}\n\n${report}\n`,
+    summary: report
+  };
+}
+
+export function touchJobHeartbeatSafely(
+  workspaceRoot,
+  jobId,
+  lastProgressAt = null,
+  touchHeartbeat = touchJobHeartbeat
+) {
+  try {
+    touchHeartbeat(workspaceRoot, jobId, lastProgressAt);
+  } catch {
+    // A missed heartbeat is harmless; reconciliation tolerates several intervals.
   }
-  return readJobFile(jobFile);
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
-  const runningRecord = {
-    ...job,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
-  };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+  const runningRecord = transitionStoredJob(job.workspaceRoot, job.id, (current) => {
+    const claimable = current.runStatus || current.status
+      ? current
+      : { ...current, status: "queued", runStatus: "QUEUED" };
+    const startedAt = current.startedAt ?? nowIso();
+    return transitionJob(claimable, {
+      ...job,
+      status: "running",
+      runStatus: "RUNNING",
+      startedAt,
+      lastProgressAt: current.lastProgressAt ?? options.getLastProgressAt?.() ?? startedAt,
+      phase: "starting",
+      pid: process.pid,
+      logFile: options.logFile ?? job.logFile ?? null
+    });
+  });
+  if (effectiveRunStatus(runningRecord) !== "RUNNING") {
+    return executionFromAcceptedJob(runningRecord);
+  }
 
+  const heartbeat = setInterval(() => {
+    touchJobHeartbeatSafely(
+      job.workspaceRoot,
+      job.id,
+      options.getLastProgressAt?.() ?? null
+    );
+  }, 5000);
+  heartbeat.unref();
   try {
-    const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
+    let execution;
+    try {
+      execution = await runner();
+    } catch (error) {
+      if (options.failureExecution) {
+        execution = await options.failureExecution(error);
+      } else {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const terminalWriteId = randomUUID();
+        const accepted = transitionStoredJob(job.workspaceRoot, job.id, (current) =>
+          transitionJob(current, {
+            status: "failed",
+            runStatus: "FAILED",
+            phase: "failed",
+            errorMessage,
+            pid: null,
+            completedAt: nowIso(),
+            terminalWriteId
+          })
+        );
+        appendJobEvent(job.workspaceRoot, job.id, {
+          type: "terminal_transition",
+          acceptedRunStatus: accepted.runStatus
+        });
+        if (accepted.terminalWriteId !== terminalWriteId) {
+          return executionFromAcceptedJob(accepted);
+        }
+        throw error;
+      }
+    }
+    const terminalWriteId = randomUUID();
+    const terminalPatch = {
+      ...buildTerminalRecord(runningRecord, execution),
+      terminalWriteId
+    };
+    const accepted = transitionStoredJob(job.workspaceRoot, job.id, (current) =>
+      transitionJob(current, terminalPatch)
+    );
+    appendJobEvent(job.workspaceRoot, job.id, {
+      type: "terminal_transition",
+      acceptedRunStatus: accepted.runStatus
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
-    return execution;
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
-    });
-    throw error;
+    const acceptedExecution = accepted.terminalWriteId === terminalWriteId
+      ? execution
+      : executionFromAcceptedJob(accepted);
+    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", acceptedExecution.rendered);
+    return acceptedExecution;
+  } finally {
+    clearInterval(heartbeat);
   }
 }

@@ -1,19 +1,19 @@
 {
-  "name": "openai-codex",
+  "name": "alanjwong-codex",
   "owner": {
-    "name": "OpenAI"
+    "name": "alanjwong"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.6"
+    "description": "Unofficial reliability fork of the OpenAI Codex plugin for Claude Code. Not affiliated with OpenAI.",
+    "version": "1.0.6-fork.3"
   },
   "plugins": [
     {
       "name": "codex",
-      "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "description": "Use Codex from Claude Code to review code or delegate tasks. Unofficial reliability fork; original plugin by OpenAI.",
+      "version": "1.0.6-fork.3",
       "author": {
-        "name": "OpenAI"
+        "name": "alanjwong (fork maintainer); original plugin by OpenAI"
       },
       "source": "./plugins/codex"
     }

@@ -1,7 +1,44 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  runCommand,
+  runCommandChecked,
+  terminateProcessTree
+} from "../plugins/codex/scripts/lib/process.mjs";
+
+function writeSigtermHelper(t) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-process-signal-"));
+  const helper = path.join(directory, "sigterm.mjs");
+  writeFileSync(
+    helper,
+    'process.kill(process.pid, "SIGTERM"); setInterval(() => {}, 1000);\n',
+    "utf8"
+  );
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return helper;
+}
+
+test("runCommand preserves signal termination", (t) => {
+  const helper = writeSigtermHelper(t);
+  const result = runCommand(process.execPath, [helper]);
+
+  assert.equal(result.status, null);
+  assert.equal(result.signal, "SIGTERM");
+});
+
+test("runCommandChecked rejects signal termination", (t) => {
+  const helper = writeSigtermHelper(t);
+
+  assert.throws(
+    () => runCommandChecked(process.execPath, [helper]),
+    /signal=SIGTERM/
+  );
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;

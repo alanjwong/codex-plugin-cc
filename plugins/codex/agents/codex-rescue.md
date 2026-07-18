@@ -31,7 +31,14 @@ Forwarding rules:
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Pass exactly one of `--write` or `--read-only` on every `task` call.
+- Use `--write` only for an explicit implementation/change request. Use `--read-only` for review, diagnosis, planning, research, or audit work.
+- Pass `--require-command codex-code-mode-host` when the selected Codex runtime depends on that host.
+- Preserve `--workflow-id`, `--task-id`, `--attempt-id`, and `--resume-job` as runtime controls; never include them in prompt prose.
+- Reuse the same attempt ID only for an exact duplicate request. A deliberate fresh retry gets a new explicit attempt ID after the prior attempt is terminal; never change prompt/capability fields under an existing attempt ID.
+- Inspect `outcomeStatus`; `runStatus=FINISHED` does not mean the task succeeded.
+- Return typed `BLOCKED`, `NEEDS_CONTEXT`, `PARTIAL`, and `INFRA_FAILED` output unchanged.
+- If invocation fails before a valid envelope is returned, preserve the companion's actionable stderr. Do not fabricate a substitute result.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
@@ -39,7 +46,6 @@ Forwarding rules:
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Return the stdout of the `codex-companion` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
 
 Response style:
 

@@ -137,7 +137,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
-  assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  assert.match(agent, /If invocation fails before a valid envelope is returned, preserve the companion's actionable stderr/i);
   assert.match(agent, /gpt-5-4-prompting/);
   assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
   assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
@@ -152,7 +152,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  assert.match(runtimeSkill, /If invocation fails before a valid envelope is returned, preserve the companion's actionable stderr/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
@@ -168,6 +168,24 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:status`/);
   assert.match(readme, /### `\/codex:result`/);
   assert.match(readme, /### `\/codex:cancel`/);
+});
+
+test("rescue always declares task intent and preserves typed failures", () => {
+  const rescue = fs.readFileSync(path.join(PLUGIN_ROOT, "agents", "codex-rescue.md"), "utf8");
+  const runtime = fs.readFileSync(path.join(PLUGIN_ROOT, "skills", "codex-cli-runtime", "SKILL.md"), "utf8");
+  const handling = fs.readFileSync(path.join(PLUGIN_ROOT, "skills", "codex-result-handling", "SKILL.md"), "utf8");
+  assert.match(rescue, /exactly one of `--write` or `--read-only`/i);
+  assert.match(runtime, /inspect `outcomeStatus`/i);
+  assert.match(handling, /preserve `BLOCKED`, `NEEDS_CONTEXT`, `PARTIAL`, and `INFRA_FAILED`/i);
+  assert.doesNotMatch(runtime, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+});
+
+test("rescue checks correlated state before retrying a timed out attempt", () => {
+  const command = fs.readFileSync(path.join(PLUGIN_ROOT, "commands", "rescue.md"), "utf8");
+  assert.match(command, /Do not launch a replacement task after a timeout/i);
+  assert.match(command, /reconcile/i);
+  assert.match(command, /--resume-job/i);
+  assert.match(command, /fresh retry.*new.*attempt ID/i);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
@@ -200,6 +218,28 @@ test("internal docs use task terminology for rescue runs", () => {
   assert.match(promptRecipes, /Use these as starting templates for Codex task prompts/i);
   assert.match(promptRecipes, /## Diagnosis/);
   assert.match(promptRecipes, /## Narrow Fix/);
+});
+
+test("intent routing is consistent: diagnosis-class work is read-only everywhere", () => {
+  const rescueAgent = read("agents/codex-rescue.md");
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+  const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
+
+  assert.match(rescueAgent, /Use `--write` only for an explicit implementation\/change request/i);
+  assert.match(runtimeSkill, /Use `--write` only for an explicit implementation\/change request/i);
+  assert.match(runtimeSkill, /Use `--read-only` for review, diagnosis, planning, research, or audit/i);
+  assert.match(promptRecipes, /review, diagnosis, planning, research, and audit recipes run with `--read-only`/i);
+  for (const [name, source] of [
+    ["agents/codex-rescue.md", rescueAgent],
+    ["skills/codex-cli-runtime/SKILL.md", runtimeSkill],
+    ["skills/gpt-5-4-prompting/references/codex-prompt-recipes.md", promptRecipes]
+  ]) {
+    assert.doesNotMatch(
+      source,
+      /write mode by default/i,
+      `${name} must not route diagnosis-class work to write mode by default`
+    );
+  }
 });
 
 test("hooks keep session-end cleanup and stop gating enabled", () => {

@@ -1,6 +1,8 @@
-name: Pull Request CI
+name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -9,8 +11,8 @@ permissions:
 jobs:
   ci:
     name: CI
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: macos-latest
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository

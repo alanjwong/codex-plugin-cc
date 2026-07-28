@@ -1,5 +1,6 @@
 # Codex for Claude Code — Unofficial Reliability Fork
 
+[![CI](https://github.com/alanjwong/codex-plugin-cc/actions/workflows/pull-request-ci.yml/badge.svg?branch=main)](https://github.com/alanjwong/codex-plugin-cc/actions/workflows/pull-request-ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Upstream](https://img.shields.io/badge/fork%20of-openai%2Fcodex--plugin--cc%20v1.0.6-black)](https://github.com/openai/codex-plugin-cc)
 [![Release](https://img.shields.io/badge/release-1.0.6--fork.3-brightgreen)](https://github.com/alanjwong/codex-plugin-cc/tags)
